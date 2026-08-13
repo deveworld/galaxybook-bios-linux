@@ -1,0 +1,19 @@
+# 삼성 펌웨어 바이너리는 절대 커밋하지 않는다.
+# 저작권자는 삼성전자이고 재배포 권한이 없다. 사용자가 직접 내려받아야 한다.
+*.exe
+*.CAP
+*.cap
+*.cab
+*.rom
+*.bin
+
+# 추출/분석 산출물
+*.efi
+te_*.bin
+mod_*.efi
+decompressed.bin
+extracted/
+
+# 파이썬
+__pycache__/
+*.py[cod]

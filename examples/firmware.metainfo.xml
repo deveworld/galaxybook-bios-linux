@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Unofficial metadata, not from Samsung. Keep the org.unofficial.* id. See ../README.md. -->
+<component type="firmware">
+  <id>org.unofficial.samsung.960XHA.firmware</id>
+  <name>Galaxy Book5 Pro System Firmware</name>
+  <summary>System firmware for Samsung Galaxy Book5 Pro (960XHA)</summary>
+  <description>
+    <p>
+      System firmware for the Samsung Galaxy Book5 Pro (NT960XHZ-AD52G / 960XHA),
+      repackaged as a UEFI capsule from the AMI BIOS Guard PFAT image inside Samsung's
+      Windows updater. Samsung signed the payload. I only added the capsule wrapper.
+    </p>
+  </description>
+
+  <provides>
+    <firmware type="flashed">a51e51f4-5de0-4c91-95fe-4197520e51d6</firmware>
+  </provides>
+
+  <url type="homepage">https://www.samsung.com/sec/support/</url>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <!-- fwupd convention: this field is the firmware author, not the packager. -->
+  <developer_name>Samsung Electronics Co., Ltd.</developer_name>
+
+  <releases>
+    <release urgency="medium" version="1122" date="2026-05-26">
+      <checksum filename="P11AMA_esrt.cap" target="content"/>
+      <description>
+        <p>BIOS P11AMA.220.260526.02, ESRT version 1122.</p>
+      </description>
+    </release>
+  </releases>
+
+  <custom>
+    <value key="LVFS::VersionFormat">number</value>
+    <value key="LVFS::UpdateProtocol">org.uefi.capsule</value>
+  </custom>
+</component>
