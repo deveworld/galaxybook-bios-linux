@@ -10,9 +10,9 @@ the ordinary UEFI capsule path that `fwupd` already drives, so wrapping that PFA
 28-byte `EFI_CAPSULE_HEADER` is enough to install it.
 
 ```console
-$ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe -o .
-$ sudo fwupdtool install-blob P11AMA_esrt.cap <device-id>
+$ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe --install
 $ sudo reboot
+$ sudo ./samsung-bios-capsule.py --check
 ```
 
 ## Scope
@@ -49,58 +49,37 @@ You don't need the `efi_capsule_loader` module. Fedora ships without it
 
 ## Usage
 
-### 1. Clone
-
 ```console
 $ git clone https://github.com/deveworld/galaxybook-bios-linux.git
 $ cd galaxybook-bios-linux
+$ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe --install
+$ sudo reboot
+$ sudo ./samsung-bios-capsule.py --check
 ```
 
-Nothing to build or install. The script needs Python 3.9+ and the standard library.
+Download the `.exe` from your model's page on Samsung support first and leave it packed. Run as
+root so the script can read ESRT. Nothing to build or install; it needs Python 3.9+ and the
+standard library.
 
-### 2. Check that your machine has a system firmware resource
+The script does the checking for you: the Authenticode subject on the exe, whether ESRT
+exposes a system firmware resource at all, whether the ESRT `fw_class` matches the
+`FirmwareId` in the updater's own INF, whether the target version clears
+`lowest_supported_fw_version`, whether the capsule it just built parses the way the firmware
+will read it, and whether the charger is connected. Any failure stops it before anything is
+staged.
 
-```console
-$ sudo grep -r . /sys/firmware/efi/esrt/entries/
-```
-
-You want an entry with `fw_type:1`. Write down its `fw_class` and `capsule_flags`, because
-those two values tell you whether your model behaves like mine: `capsule_flags` should be
-`0x50000`. `fwupd` should list the same device:
-
-```console
-$ fwupdmgr get-devices | grep -A6 'System Firmware'
-```
-
-If `fw_type:1` is missing, or `fwupd` doesn't show the device as `Updatable`, stop here.
-
-### 3. Get the updater from Samsung
-
-Find your model on Samsung's support site and download the BIOS update, which arrives as
-something like `ITEM_20260622_22578_WIN_P11AMA.exe`. Leave it packed; the script reads it
-directly.
-
-Checking the Authenticode signature first is worth the minute (`dnf install osslsigncode`):
-
-```console
-$ osslsigncode verify ITEM_20260622_22578_WIN_P11AMA.exe
-```
-
-The signer should be Samsung Electronics Co., Ltd. via DigiCert.
-
-### 4. Build the capsule
-
-Run it as root so it can read ESRT and work the values out for itself. This transcript is from
-the upgrade I actually ran:
+Without `--install` it stops after building the capsule and prints the `fwupdtool` command, so
+you can look at the file first. This is the transcript from the upgrade I ran:
 
 ```console
 $ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe -o .
 input: ITEM_20260622_22578_WIN_P11AMA.exe  (15,947,928 bytes)
+  signed by: Samsung Electronics Co., Ltd.
   PFAT payload: P11AMA.CAP  25,362,432 bytes
   embedded INF: FirmwareId=A51E51F4-5DE0-4C91-95FE-4197520E51D6  target=1122  DriverVer=05/26/2026,10.0.11.22
-  ESRT: fw_class=A51E51F4-5DE0-4C91-95FE-4197520E51D6
+  ESRT entry0: fw_class=A51E51F4-5DE0-4C91-95FE-4197520E51D6
         current=920  lowest=920  capsule_flags=0x50000
-        last attempt: version=920 status=0
+        last attempt: version=920 status=0 (success)
 
 header values from: CapsuleGuid <- ESRT fw_class,  Flags <- ESRT capsule_flags
 
@@ -122,61 +101,25 @@ output: P11AMA_esrt.cap  (25,362,460 bytes)
   sha256 = b48aa5d9afb583a6430e9d8ef6bfa74b706413032c1eb1eba6e2972d81493691
 
 ========================================================================
-install (AC adapter required):
+re-run with --install to stage it, or do that step yourself:
   sudo fwupdtool install-blob P11AMA_esrt.cap \
     43f2ef9507cdf22b2389bbaebcdfe00c2f2e96bd
 
-check the result after rebooting:
-  sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/
-    last_attempt_status  0=success  3=version refused  4=bad image format  5=auth failed  6/7=power
+then reboot and read the result:
+  sudo reboot
+  sudo ./samsung-bios-capsule.py --check
 ========================================================================
 ```
 
-Every check has to read `OK`. If any of them says `FAIL` the script refuses to print an
-install command, so do not go looking for one.
+`--install` only stages the capsule on the ESP and sets `BootNext`. The flash happens during
+the next boot, which takes longer than a normal startup and may reboot more than once.
 
-You get two files: the extracted `P11AMA.CAP` payload and `P11AMA_esrt.cap`, which is the
-same payload with the 28-byte header on the front. The second one is what you install.
+`--check` reads the ESRT entry afterwards and turns `last_attempt_status` into a sentence,
+exiting non-zero if the flash did not happen. The status codes are in
+[Troubleshooting](#troubleshooting) if you want to read them yourself.
 
-### 5. Install
-
-Plug the charger in and check that it took, because `fwupd` refuses to run on battery and the
-error it gives is easy to misread as something else:
-
-```console
-$ grep . /sys/class/power_supply/*/online     # the mains supply should read 1
-```
-
-Then run the command the script printed:
-
-```console
-$ sudo fwupdtool install-blob P11AMA_esrt.cap 43f2ef9507cdf22b2389bbaebcdfe00c2f2e96bd
-```
-
-Your device ID differs from mine. The script looks it up through `fwupdmgr` and prints it, but
-if that lookup fails it prints a placeholder and you get the ID from `fwupdmgr get-devices`.
-
-This stages the capsule on the ESP and sets `BootNext`. Nothing has been flashed yet.
-
-### 6. Reboot and verify
-
-```console
-$ sudo reboot
-```
-
-The firmware flashes during boot, which takes longer than a normal startup and may reboot the
-machine more than once. Don't cut the power.
-
-Once you're back up, check all three sources:
-
-```console
-$ sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/
-$ cat /sys/class/dmi/id/bios_version
-$ fwupdmgr get-devices | grep -A6 'System Firmware'
-```
-
-`last_attempt_status` should be `0` and `fw_version` should have advanced. The
-[Troubleshooting](#troubleshooting) table covers the other status codes.
+The signature check reads certificate subject strings out of the PKCS#7 blob. It is not
+cryptographic verification, so it tells you the exe claims to be Samsung's, not that it is.
 
 ### Options
 
@@ -188,11 +131,9 @@ so a new BIOS release or a different model may just work:
 | `CapsuleGuid` | ESRT `fw_class` | INF `FirmwareId` |
 | `Flags` | ESRT `capsule_flags` | `0x50000` |
 
-The target version comes from the INF's `FirmwareVersion`, and the script stops if that INF's
-`FirmwareId` disagrees with ESRT `fw_class`, because a mismatch means the `.exe` is for a
-different machine. It also refuses a target below the firmware's
-`lowest_supported_fw_version` and warns on downgrades. Without root it falls back to the INF
-values and the default flags, and `--guid` / `--flags` override both.
+Without root it falls back to the INF values and the default flags, which is enough to build a
+capsule but skips every ESRT check. `--guid` and `--flags` override both. `-o` picks the output
+directory.
 
 ## How it works
 

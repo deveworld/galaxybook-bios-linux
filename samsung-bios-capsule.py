@@ -5,11 +5,13 @@ Samsung Galaxy Book BIOS updater (.exe) to UEFI capsule, for Linux.
 Samsung's Windows updater carries a raw PFAT (AMI BIOS Guard) image. Pull that
 out, wrap it in a 28-byte EFI_CAPSULE_HEADER, and fwupd can install it.
 
-This does not flash anything. It builds the capsule, verifies it, and prints the
-install command.
+    sudo ./samsung-bios-capsule.py ITEM_xxxxx_WIN_P11AMA.exe --install
+    sudo reboot
+    sudo ./samsung-bios-capsule.py --check
 
-Usage:
-    ./samsung-bios-capsule.py ITEM_xxxxx_WIN_P11AMA.exe [-o OUTDIR]
+Without --install it stops after building and verifying the capsule and prints
+the fwupdtool command for you to run yourself. --check reads the result the
+firmware left in ESRT after the reboot.
 
 Header values are read off the machine:
   - ESRT (/sys/firmware/efi/esrt) -> CapsuleGuid, Flags, current/lowest version
@@ -31,8 +33,22 @@ import uuid
 import zlib
 
 ESRT = pathlib.Path("/sys/firmware/efi/esrt/entries")
+POWER = pathlib.Path("/sys/class/power_supply")
+DMI_VERSION = pathlib.Path("/sys/class/dmi/id/bios_version")
 CAPSULE_HEADER_SIZE = 0x1C
 FALLBACK_FLAGS = 0x00050000  # PERSIST_ACROSS_RESET | INITIATE_RESET
+
+# ESRT last_attempt_status, UEFI spec table "ESRT and FMP Fields"
+ATTEMPT_STATUS = {
+    0: "success",
+    1: "unsuccessful",
+    2: "insufficient resources",
+    3: "incorrect version",
+    4: "invalid image format",
+    5: "authentication error",
+    6: "AC power not connected",
+    7: "insufficient battery",
+}
 
 
 def die(msg):
@@ -120,7 +136,39 @@ def find_inf(exe_bytes):
     return None
 
 
-# ------------------------------------------------------------------------- ESRT
+def signer_names(exe_bytes):
+    """Subject strings from the PE Authenticode block, or None if there is none.
+
+    This pulls certificate subject strings out of the PKCS#7 blob. It does not
+    verify the signature cryptographically, so a Samsung match means "claims to
+    be Samsung", not "proven to be Samsung".
+    """
+    try:
+        e_lfanew, = struct.unpack_from("<I", exe_bytes, 0x3C)
+        if exe_bytes[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+            return None
+        opt = e_lfanew + 24
+        magic, = struct.unpack_from("<H", exe_bytes, opt)
+        dirs = opt + (112 if magic == 0x20B else 96)
+        addr, size = struct.unpack_from("<II", exe_bytes, dirs + 4 * 8)
+        if not addr or not size:
+            return None
+        blob = exe_bytes[addr:addr + size]
+    except Exception:
+        return None
+    names = set()
+    for m in re.finditer(rb"[\x20-\x7e]{6,}", blob):
+        s = re.sub(r"^[^A-Za-z]*", "", m.group().decode("latin1"))
+        # A printable run usually spills one byte into the next DER tag, which
+        # is 0x30 or 0x31, i.e. "0" or "1" landing right after "Ltd." or "Inc,".
+        if len(s) > 2 and s[-1] in "01" and s[-2] in ".,":
+            s = s[:-1]
+        if re.search(r"Samsung|DigiCert|Sectigo|GlobalSign|Entrust|Certum", s):
+            names.add(s)
+    return sorted(names)
+
+
+# ------------------------------------------------------------------------- system
 
 def read_esrt():
     """Read the fw_type==1 (system firmware) ESRT entry. None unless root."""
@@ -138,6 +186,7 @@ def read_esrt():
         if vals.get("fw_type") != "1":
             continue
         return {
+            "entry": entry.name,
             "guid": uuid.UUID(vals["fw_class"]),
             "version": int(vals["fw_version"]),
             "lowest": int(vals["lowest_supported_fw_version"]),
@@ -146,6 +195,24 @@ def read_esrt():
             "last_status": int(vals["last_attempt_status"]),
         }
     return None
+
+
+def read_power():
+    """Return (ac_online, battery_percent). Either may be None if unknown."""
+    ac, batt = None, None
+    if not POWER.is_dir():
+        return ac, batt
+    for supply in sorted(POWER.iterdir()):
+        try:
+            kind = (supply / "type").read_text().strip()
+            if kind == "Mains":
+                online = (supply / "online").read_text().strip() == "1"
+                ac = True if online else (ac or False)
+            elif kind == "Battery" and (supply / "capacity").exists():
+                batt = int((supply / "capacity").read_text().strip())
+        except (OSError, ValueError):
+            continue
+    return ac, batt
 
 
 def find_fwupd_device(guid):
@@ -163,6 +230,13 @@ def find_fwupd_device(guid):
         elif str(guid) in line.lower() and dev:
             return dev
     return None
+
+
+def dmi_version():
+    try:
+        return DMI_VERSION.read_text().strip()
+    except OSError:
+        return None
 
 
 # -------------------------------------------------------------- building the capsule
@@ -204,18 +278,67 @@ def verify(cap, expect_guid, expect_flags):
     return ok
 
 
+# --------------------------------------------------------------------- --check mode
+
+def report_result():
+    """Read what the firmware recorded in ESRT after a reboot."""
+    esrt = read_esrt()
+    if esrt is None:
+        die("cannot read ESRT, run this as root")
+    status = esrt["last_status"]
+    print(f"ESRT {esrt['entry']}  fw_class={str(esrt['guid']).upper()}")
+    print(f"  current version:      {esrt['version']}")
+    print(f"  lowest supported:     {esrt['lowest']}")
+    print(f"  last attempt version: {esrt['last_version']}")
+    print(f"  last attempt status:  {status} "
+          f"({ATTEMPT_STATUS.get(status, 'unrecognised')})")
+    dmi = dmi_version()
+    if dmi:
+        print(f"  DMI bios_version:     {dmi}")
+    print()
+
+    if status == 0 and esrt["version"] == esrt["last_version"]:
+        print(f"Flashed. The firmware is now at {esrt['version']}.")
+    elif status == 0:
+        print("No failure recorded, but the running version does not match the last")
+        print("attempt, so nothing was flashed on the last boot.")
+    elif status in (6, 7):
+        print("Refused on power. Connect the charger, let it charge, then retry.")
+    elif status == 5:
+        print("BIOS Guard rejected the payload signature. Stop here, and do not retry")
+        print("with the same file.")
+    elif status == 4:
+        print("The firmware rejected the capsule format, so the wrapper is wrong for")
+        print("this machine. See docs/reverse-engineering.md section 5.")
+    elif status == 3:
+        print(f"Version refused. The target has to be at least {esrt['lowest']}.")
+    else:
+        print("The flash failed without a specific reason. Look for a BIOS recovery")
+        print("option in the firmware setup menu before retrying.")
+    return 0 if status == 0 and esrt["version"] == esrt["last_version"] else 1
+
+
 # ------------------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser(
         description="Samsung BIOS updater exe to a UEFI capsule for fwupd")
-    ap.add_argument("exe", type=pathlib.Path, help="ITEM_*_WIN_*.exe")
+    ap.add_argument("exe", type=pathlib.Path, nargs="?",
+                    help="ITEM_*_WIN_*.exe from Samsung support")
     ap.add_argument("-o", "--outdir", type=pathlib.Path, default=None,
                     help="output directory (default: alongside the exe)")
+    ap.add_argument("--install", action="store_true",
+                    help="run fwupdtool install-blob once every check passes")
+    ap.add_argument("--check", action="store_true",
+                    help="read the post-reboot result out of ESRT and exit")
     ap.add_argument("--guid", help="set CapsuleGuid, for when ESRT is unreadable")
     ap.add_argument("--flags", help="set Flags, e.g. 0x50000")
     args = ap.parse_args()
 
+    if args.check:
+        return report_result()
+    if args.exe is None:
+        ap.error("give an exe to convert, or --check to read the last result")
     if not args.exe.is_file():
         die(f"no such file: {args.exe}")
     outdir = args.outdir or args.exe.parent
@@ -223,6 +346,15 @@ def main():
 
     exe = args.exe.read_bytes()
     print(f"input: {args.exe.name}  ({len(exe):,} bytes)")
+
+    # --- who signed the exe
+    names = signer_names(exe)
+    if names is None:
+        warn("no Authenticode signature block in this exe")
+    elif any("Samsung" in n for n in names):
+        print(f"  signed by: {next(n for n in names if 'Samsung' in n)}")
+    else:
+        warn(f"signature block present, no Samsung subject: {', '.join(names)}")
 
     # --- payload and metadata
     pfat_name, pfat = find_pfat(exe)
@@ -237,13 +369,19 @@ def main():
 
     esrt = read_esrt()
     if esrt:
-        print(f"  ESRT: fw_class={str(esrt['guid']).upper()}")
+        print(f"  ESRT {esrt['entry']}: fw_class={str(esrt['guid']).upper()}")
         print(f"        current={esrt['version']}  lowest={esrt['lowest']}  "
               f"capsule_flags=0x{esrt['flags']:X}")
         print(f"        last attempt: version={esrt['last_version']} "
-              f"status={esrt['last_status']}")
+              f"status={esrt['last_status']} "
+              f"({ATTEMPT_STATUS.get(esrt['last_status'], '?')})")
+        if esrt["flags"] != FALLBACK_FLAGS:
+            warn(f"capsule_flags is 0x{esrt['flags']:X}, not the "
+                 f"0x{FALLBACK_FLAGS:X} this was developed against")
     else:
-        warn("could not read ESRT, run as root to detect these automatically")
+        warn("could not read ESRT. Run as root so it gets detected; if you already "
+             "are root, this machine exposes no system firmware resource and the "
+             "capsule will not install")
 
     # --- pick header values: ESRT, then INF, then the default
     if args.guid:
@@ -295,18 +433,44 @@ def main():
     if not ok:
         die("verification failed, do not install this")
 
-    # --- how to install it
+    # --- power state, then either install or print the command
     dev = find_fwupd_device(guid)
-    print("\n" + "=" * 72)
-    print("install (AC adapter required):")
+    ac, batt = read_power()
+    print()
+    if ac is False:
+        warn("AC adapter not connected, fwupd will refuse to install")
+    elif ac is None:
+        warn("could not read the power supply state")
+    if batt is not None and batt < 30:
+        warn(f"battery at {batt}%, charge it before flashing firmware")
+
+    self_cmd = sys.argv[0] if sys.argv[0].startswith(("/", ".")) else f"./{sys.argv[0]}"
+
+    if args.install:
+        if not dev:
+            die("could not resolve the fwupd device ID, install it manually")
+        if ac is not True:
+            die("connect the AC adapter and run this again")
+        cmd = ["fwupdtool", "install-blob", str(cap_path), dev]
+        print("staging: " + " ".join(cmd))
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            die(f"fwupdtool exited {rc}, nothing was staged")
+        print("\nStaged on the ESP. The flash happens during the next boot.")
+        print("  sudo reboot")
+        print(f"  sudo {self_cmd} --check")
+        return 0
+
+    print("=" * 72)
+    print("re-run with --install to stage it, or do that step yourself:")
     print(f"  sudo fwupdtool install-blob {cap_path} \\")
     print(f"    {dev if dev else '<device ID: System Firmware in fwupdmgr get-devices>'}")
-    print("\ncheck the result after rebooting:")
-    print("  sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/")
-    print("    last_attempt_status  0=success  3=version refused  "
-          "4=bad image format  5=auth failed  6/7=power")
+    print("\nthen reboot and read the result:")
+    print("  sudo reboot")
+    print(f"  sudo {self_cmd} --check")
     print("=" * 72)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -9,9 +9,9 @@ English: [README.md](README.md)
 경로로 업데이트를 받아서, PFAT에 28바이트 `EFI_CAPSULE_HEADER`만 씌우면 설치됩니다.
 
 ```console
-$ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe -o .
-$ sudo fwupdtool install-blob P11AMA_esrt.cap <device-id>
+$ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe --install
 $ sudo reboot
+$ sudo ./samsung-bios-capsule.py --check
 ```
 
 ## 범위
@@ -51,57 +51,34 @@ ESP에 올려두고 부팅할 때 `fwupdx64.efi`에서 `UpdateCapsule()`을 부�
 
 ## 사용법
 
-### 1. 클론
-
 ```console
 $ git clone https://github.com/deveworld/galaxybook-bios-linux.git
 $ cd galaxybook-bios-linux
+$ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe --install
+$ sudo reboot
+$ sudo ./samsung-bios-capsule.py --check
 ```
 
-빌드나 설치할 게 없습니다. Python 3.9 이상과 표준 라이브러리만 있으면 됩니다.
+`.exe`는 삼성 지원 사이트의 내 모델 페이지에서 받아 두고 압축은 풀지 마세요. ESRT를 읽어야
+하니 root로 돌립니다. 빌드나 설치할 건 없고 Python 3.9 이상과 표준 라이브러리만 쓰면 됩니다.
 
-### 2. 기기에 시스템 펌웨어 리소스가 있는지 확인
+확인은 스크립트가 합니다. exe의 Authenticode 서명자, ESRT에 시스템 펌웨어 리소스가 있는지,
+ESRT `fw_class`가 업데이터 INF의 `FirmwareId`와 같은지, 목표 버전이
+`lowest_supported_fw_version`을 넘는지, 방금 만든 캡슐이 펌웨어가 읽는 순서로 파싱되는지,
+충전기가 꽂혀 있는지까지 봅니다. 하나라도 실패하면 아무것도 스테이징하지 않고 멈춥니다.
 
-```console
-$ sudo grep -r . /sys/firmware/efi/esrt/entries/
-```
-
-`fw_type:1`인 엔트리가 있어야 합니다. 그 엔트리의 `fw_class`와 `capsule_flags`를 적어 두세요.
-이 두 값으로 내 모델이 제 것과 같은 방식인지 알 수 있고, `capsule_flags`는 `0x50000`이어야
-합니다. `fwupd`에도 같은 장치가 보입니다.
-
-```console
-$ fwupdmgr get-devices | grep -A6 'System Firmware'
-```
-
-`fw_type:1`이 없거나 `fwupd`가 이 장치를 `Updatable`로 표시하지 않으면 여기서 멈추세요.
-
-### 3. 삼성에서 업데이터 받기
-
-삼성 지원 사이트에서 내 모델을 찾아 BIOS 업데이트를 받습니다.
-`ITEM_20260622_22578_WIN_P11AMA.exe` 같은 이름으로 떨어집니다. 압축을 풀지 마세요. 스크립트가
-그 파일을 직접 읽습니다.
-
-Authenticode 서명을 먼저 확인하는 데 1분이면 됩니다(`dnf install osslsigncode`).
-
-```console
-$ osslsigncode verify ITEM_20260622_22578_WIN_P11AMA.exe
-```
-
-서명자가 DigiCert 경유 Samsung Electronics Co., Ltd.여야 합니다.
-
-### 4. 캡슐 만들기
-
-root로 돌리면 ESRT를 읽어서 값을 알아서 채웁니다. 아래는 제가 실제로 올릴 때의 출력입니다.
+`--install` 없이 돌리면 캡슐만 만들고 `fwupdtool` 명령을 찍어 줍니다. 파일을 먼저 보고
+싶을 때 쓰면 됩니다. 아래는 제가 올릴 때의 출력입니다.
 
 ```console
 $ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe -o .
 input: ITEM_20260622_22578_WIN_P11AMA.exe  (15,947,928 bytes)
+  signed by: Samsung Electronics Co., Ltd.
   PFAT payload: P11AMA.CAP  25,362,432 bytes
   embedded INF: FirmwareId=A51E51F4-5DE0-4C91-95FE-4197520E51D6  target=1122  DriverVer=05/26/2026,10.0.11.22
-  ESRT: fw_class=A51E51F4-5DE0-4C91-95FE-4197520E51D6
+  ESRT entry0: fw_class=A51E51F4-5DE0-4C91-95FE-4197520E51D6
         current=920  lowest=920  capsule_flags=0x50000
-        last attempt: version=920 status=0
+        last attempt: version=920 status=0 (success)
 
 header values from: CapsuleGuid <- ESRT fw_class,  Flags <- ESRT capsule_flags
 
@@ -123,61 +100,25 @@ output: P11AMA_esrt.cap  (25,362,460 bytes)
   sha256 = b48aa5d9afb583a6430e9d8ef6bfa74b706413032c1eb1eba6e2972d81493691
 
 ========================================================================
-install (AC adapter required):
+re-run with --install to stage it, or do that step yourself:
   sudo fwupdtool install-blob P11AMA_esrt.cap \
     43f2ef9507cdf22b2389bbaebcdfe00c2f2e96bd
 
-check the result after rebooting:
-  sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/
-    last_attempt_status  0=success  3=version refused  4=bad image format  5=auth failed  6/7=power
+then reboot and read the result:
+  sudo reboot
+  sudo ./samsung-bios-capsule.py --check
 ========================================================================
 ```
 
-검사 항목이 전부 `OK`여야 합니다. 하나라도 `FAIL`이면 스크립트가 설치 명령을 찍지 않으니,
-없는 명령을 찾지 마세요.
+`--install`은 캡슐을 ESP에 올리고 `BootNext`만 설정합니다. 굽는 건 다음 부팅 때고, 평소보다
+오래 걸리고 재부팅이 두 번 이상 일어날 수 있습니다.
 
-파일이 두 개 나옵니다. 추출한 `P11AMA.CAP` 페이로드와, 그 앞에 28바이트 헤더를 붙인
-`P11AMA_esrt.cap`입니다. 설치하는 건 두 번째입니다.
+`--check`는 재부팅 후 ESRT를 읽어서 `last_attempt_status`를 문장으로 바꿔 주고, 플래시가
+안 됐으면 0이 아닌 코드로 끝납니다. 상태 코드를 직접 보고 싶으면 [문제 해결](#문제-해결)에
+정리해 뒀습니다.
 
-### 5. 설치
-
-충전기를 꽂고 실제로 인식됐는지 확인하세요. `fwupd`는 배터리로는 실행을 거부하는데, 그때 뜨는
-메시지가 다른 문제로 읽히기 쉽습니다.
-
-```console
-$ grep . /sys/class/power_supply/*/online     # 어댑터 쪽이 1이어야 함
-```
-
-그다음 스크립트가 찍어 준 명령을 실행합니다.
-
-```console
-$ sudo fwupdtool install-blob P11AMA_esrt.cap 43f2ef9507cdf22b2389bbaebcdfe00c2f2e96bd
-```
-
-장치 ID는 기기마다 다릅니다. 스크립트가 `fwupdmgr`로 조회해서 찍어 주고, 조회가 실패하면
-자리표시자를 출력하니 `fwupdmgr get-devices`에서 직접 가져오면 됩니다.
-
-이 명령은 캡슐을 ESP에 올리고 `BootNext`를 설정합니다. 아직 아무것도 굽지 않았습니다.
-
-### 6. 재부팅과 확인
-
-```console
-$ sudo reboot
-```
-
-부팅 중에 펌웨어가 굽습니다. 평소 부팅보다 오래 걸리고 재부팅이 두 번 이상 일어날 수 있으니
-전원을 끊지 마세요.
-
-올라오면 세 군데를 다 확인합니다.
-
-```console
-$ sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/
-$ cat /sys/class/dmi/id/bios_version
-$ fwupdmgr get-devices | grep -A6 'System Firmware'
-```
-
-`last_attempt_status`가 `0`이고 `fw_version`이 올라가 있어야 합니다. 다른 상태 코드는
-[문제 해결](#문제-해결)에 정리해 뒀습니다.
+서명 확인은 PKCS#7 블롭에서 인증서 subject 문자열을 읽는 방식입니다. 암호학적 검증이 아니라서,
+exe가 삼성 것이라고 주장한다는 정도만 알려 줍니다.
 
 ### 옵션
 
@@ -189,10 +130,8 @@ $ fwupdmgr get-devices | grep -A6 'System Firmware'
 | `CapsuleGuid` | ESRT `fw_class` | INF `FirmwareId` |
 | `Flags` | ESRT `capsule_flags` | `0x50000` |
 
-목표 버전은 INF의 `FirmwareVersion`에서 가져옵니다. 그 INF의 `FirmwareId`가 ESRT
-`fw_class`와 다르면 멈춥니다. 다른 기기용 `.exe`라는 뜻이니까요. 목표 버전이 펌웨어의
-`lowest_supported_fw_version`보다 낮으면 거부하고, 다운그레이드면 경고만 띄웁니다. root가
-아니면 INF 값과 기본 플래그로 넘어가고, `--guid`와 `--flags`로 직접 박을 수도 있습니다. 다른
+root가 아니면 INF 값과 기본 플래그로 넘어갑니다. 캡슐은 만들어지지만 ESRT 검사가 전부
+빠집니다. `--guid`와 `--flags`로 직접 박을 수 있고, `-o`로 출력 위치를 지정합니다. 다른
 모델에서는 안 해 봤습니다.
 
 ## 원리
