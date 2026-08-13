@@ -49,20 +49,139 @@ You don't need the `efi_capsule_loader` module. Fedora ships without it
 
 ## Usage
 
-Run it as root so it can read ESRT and work the values out for itself.
+### 1. Clone
+
+```console
+$ git clone https://github.com/deveworld/galaxybook-bios-linux.git
+$ cd galaxybook-bios-linux
+```
+
+Nothing to build or install. The script needs Python 3.9+ and the standard library.
+
+### 2. Check that your machine has a system firmware resource
+
+```console
+$ sudo grep -r . /sys/firmware/efi/esrt/entries/
+```
+
+You want an entry with `fw_type:1`. Write down its `fw_class` and `capsule_flags`, because
+those two values tell you whether your model behaves like mine: `capsule_flags` should be
+`0x50000`. `fwupd` should list the same device:
+
+```console
+$ fwupdmgr get-devices | grep -A6 'System Firmware'
+```
+
+If `fw_type:1` is missing, or `fwupd` doesn't show the device as `Updatable`, stop here.
+
+### 3. Get the updater from Samsung
+
+Find your model on Samsung's support site and download the BIOS update, which arrives as
+something like `ITEM_20260622_22578_WIN_P11AMA.exe`. Leave it packed; the script reads it
+directly.
+
+Checking the Authenticode signature first is worth the minute (`dnf install osslsigncode`):
+
+```console
+$ osslsigncode verify ITEM_20260622_22578_WIN_P11AMA.exe
+```
+
+The signer should be Samsung Electronics Co., Ltd. via DigiCert.
+
+### 4. Build the capsule
+
+Run it as root so it can read ESRT and work the values out for itself. This transcript is from
+the upgrade I actually ran:
 
 ```console
 $ sudo ./samsung-bios-capsule.py ITEM_20260622_22578_WIN_P11AMA.exe -o .
-입력: ITEM_20260622_22578_WIN_P11AMA.exe  (15,947,928 bytes)
-  PFAT 페이로드: P11AMA.CAP  25,362,432 bytes
-  내장 INF: FirmwareId=A51E51F4-...  목표버전=1122
-  ESRT: fw_class=A51E51F4-...  현재=920  최저지원=920  capsule_flags=0x50000
-  OK    업그레이드: 920 → 1122
+input: ITEM_20260622_22578_WIN_P11AMA.exe  (15,947,928 bytes)
+  PFAT payload: P11AMA.CAP  25,362,432 bytes
+  embedded INF: FirmwareId=A51E51F4-5DE0-4C91-95FE-4197520E51D6  target=1122  DriverVer=05/26/2026,10.0.11.22
+  ESRT: fw_class=A51E51F4-5DE0-4C91-95FE-4197520E51D6
+        current=920  lowest=920  capsule_flags=0x50000
+        last attempt: version=920 status=0
+
+header values from: CapsuleGuid <- ESRT fw_class,  Flags <- ESRT capsule_flags
+
+pre-flight:
+  OK    ESRT fw_class == INF FirmwareId
+  OK    upgrade: 920 -> 1122
+
+header, as CapsulePei reads it:
+  OK    CapsuleGuid: A51E51F4-5DE0-4C91-95FE-4197520E51D6
+  OK    HeaderSize: 0x1C
+  OK    Flags: 0x00050000
+  OK    CapsuleImageSize: 25,362,460
+body at capsule+HeaderSize, as BiosGuardPei reads it:
+  OK    body[8:16] signature: _AMIPFAT
+  OK    body[0:4] script length: 0x1C8 (limit 0x2020000)
+  OK    text before first CRLF: AMI_BIOS_GUARD_FLASH_CONFIGURATIONS
+
+output: P11AMA_esrt.cap  (25,362,460 bytes)
+  sha256 = b48aa5d9afb583a6430e9d8ef6bfa74b706413032c1eb1eba6e2972d81493691
+
+========================================================================
+install (AC adapter required):
+  sudo fwupdtool install-blob P11AMA_esrt.cap \
+    43f2ef9507cdf22b2389bbaebcdfe00c2f2e96bd
+
+check the result after rebooting:
+  sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/
+    last_attempt_status  0=success  3=version refused  4=bad image format  5=auth failed  6/7=power
+========================================================================
 ```
 
-It builds and verifies the capsule, then prints the install command; nothing reaches firmware
-until you run `fwupdtool`. The script reads the header values off your own machine instead of
-shipping them as constants, so a new BIOS release or a different model may just work:
+Every check has to read `OK`. If any of them says `FAIL` the script refuses to print an
+install command, so do not go looking for one.
+
+You get two files: the extracted `P11AMA.CAP` payload and `P11AMA_esrt.cap`, which is the
+same payload with the 28-byte header on the front. The second one is what you install.
+
+### 5. Install
+
+Plug the charger in and check that it took, because `fwupd` refuses to run on battery and the
+error it gives is easy to misread as something else:
+
+```console
+$ grep . /sys/class/power_supply/*/online     # the mains supply should read 1
+```
+
+Then run the command the script printed:
+
+```console
+$ sudo fwupdtool install-blob P11AMA_esrt.cap 43f2ef9507cdf22b2389bbaebcdfe00c2f2e96bd
+```
+
+Your device ID differs from mine. The script looks it up through `fwupdmgr` and prints it, but
+if that lookup fails it prints a placeholder and you get the ID from `fwupdmgr get-devices`.
+
+This stages the capsule on the ESP and sets `BootNext`. Nothing has been flashed yet.
+
+### 6. Reboot and verify
+
+```console
+$ sudo reboot
+```
+
+The firmware flashes during boot, which takes longer than a normal startup and may reboot the
+machine more than once. Don't cut the power.
+
+Once you're back up, check all three sources:
+
+```console
+$ sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/
+$ cat /sys/class/dmi/id/bios_version
+$ fwupdmgr get-devices | grep -A6 'System Firmware'
+```
+
+`last_attempt_status` should be `0` and `fw_version` should have advanced. The
+[Troubleshooting](#troubleshooting) table covers the other status codes.
+
+### Options
+
+The script reads the header values off your own machine instead of shipping them as constants,
+so a new BIOS release or a different model may just work:
 
 | Header field | Source | Fallback |
 |---|---|---|

@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-삼성 Galaxy Book BIOS 업데이터(.exe) → UEFI 캡슐 변환기 (리눅스용)
+Samsung Galaxy Book BIOS updater (.exe) to UEFI capsule, for Linux.
 
-삼성 Windows 업데이터 안에는 날 PFAT(AMI BIOS Guard) 이미지가 들어 있다.
-그걸 꺼내서 28바이트 EFI_CAPSULE_HEADER를 씌우면 fwupd로 설치할 수 있다.
+Samsung's Windows updater carries a raw PFAT (AMI BIOS Guard) image. Pull that
+out, wrap it in a 28-byte EFI_CAPSULE_HEADER, and fwupd can install it.
 
-플래시는 하지 않는다. 캡슐을 만들고 검증해서 설치 명령만 찍어 준다.
+This does not flash anything. It builds the capsule, verifies it, and prints the
+install command.
 
-사용법:
-    ./samsung-bios-capsule.py ITEM_xxxxx_WIN_P11AMA.exe [-o 출력디렉터리]
+Usage:
+    ./samsung-bios-capsule.py ITEM_xxxxx_WIN_P11AMA.exe [-o OUTDIR]
 
-헤더 값은 기기에서 직접 읽어 온다:
-  - ESRT (/sys/firmware/efi/esrt) → CapsuleGuid, Flags, 현재/최저 지원 버전
-  - exe 내장 WFU_*.inf            → FirmwareId, 목표 버전
+Header values are read off the machine:
+  - ESRT (/sys/firmware/efi/esrt) -> CapsuleGuid, Flags, current/lowest version
+  - WFU_*.inf inside the exe       -> FirmwareId, target version
 
-근거는 README.ko.md 참조.
+See docs/reverse-engineering.md for the evidence behind the format.
 """
 
 import argparse
@@ -35,17 +36,17 @@ FALLBACK_FLAGS = 0x00050000  # PERSIST_ACROSS_RESET | INITIATE_RESET
 
 
 def die(msg):
-    sys.exit(f"오류: {msg}")
+    sys.exit(f"error: {msg}")
 
 
 def warn(msg):
-    print(f"  경고: {msg}")
+    print(f"  warning: {msg}")
 
 
-# ---------------------------------------------------------------- exe 해체
+# ------------------------------------------------------------ taking the exe apart
 
 def _gunzip_at(blob, off):
-    """오프셋의 gzip 스트림을 해제. 뒤에 붙은 쓰레기 데이터를 허용한다."""
+    """Inflate the gzip stream at off, tolerating trailing garbage."""
     try:
         return gzip.GzipFile(fileobj=io.BytesIO(blob[off:])).read()
     except Exception:
@@ -53,10 +54,10 @@ def _gunzip_at(blob, off):
 
 
 def extract_embedded(exe_bytes, suffix):
-    """'<이름><suffix>.gz' UTF-16 파일명 뒤의 첫 gzip 블롭을 해제해 돌려준다.
+    """Inflate the first gzip blob after each '<name><suffix>.gz' UTF-16 filename.
 
-    삼성 UnPacker는 파일명 레코드 뒤 0x20c 바이트 지점에 gzip 데이터를 둔다.
-    오프셋을 가정하지 않고 파일명 다음 첫 gzip 매직을 찾는다.
+    Samsung's UnPacker puts the gzip data 0x20c bytes past the filename record.
+    Rather than trust that offset, look for the next gzip magic after the name.
     """
     needle = (suffix + ".gz").encode("utf-16-le")
     results = []
@@ -77,11 +78,12 @@ def extract_embedded(exe_bytes, suffix):
 
 
 def find_pfat(exe_bytes):
-    """PFAT 페이로드(<모델>.CAP)를 찾아 (이름, 데이터)로 돌려준다."""
+    """Return (name, data) for the PFAT payload, i.e. <model>.CAP."""
     for name_off, gz_off, data in extract_embedded(exe_bytes, ".CAP"):
         if data[8:16] == b"_AMIPFAT":
-            # 파일명은 needle 앞쪽에 있다. UTF-16이라 문자당 2바이트이고
-            # 창 시작점의 홀짝을 needle과 맞춰야 디코딩이 깨지지 않는다.
+            # The filename sits before the needle. UTF-16 is two bytes per
+            # character, so the window start has to match the needle's parity
+            # or the decode comes out shifted.
             needle_len = len((".CAP" + ".gz").encode("utf-16-le"))
             window = exe_bytes[max(0, name_off - 64):name_off + needle_len]
             nm = "BIOS.CAP"
@@ -93,11 +95,11 @@ def find_pfat(exe_bytes):
             except Exception:
                 pass
             return nm, data
-    die("exe 안에서 PFAT 페이로드(*.CAP)를 찾지 못했습니다")
+    die("no PFAT payload (*.CAP) found inside the exe")
 
 
 def find_inf(exe_bytes):
-    """내장 WFU INF를 파싱해 {FirmwareId, FirmwareVersion, DriverVer}를 돌려준다."""
+    """Parse the embedded WFU INF into {guid, version, driver_ver}."""
     for _, _, data in extract_embedded(exe_bytes, ".inf"):
         for enc in ("utf-16-le", "latin1"):
             try:
@@ -118,10 +120,10 @@ def find_inf(exe_bytes):
     return None
 
 
-# ---------------------------------------------------------------- ESRT
+# ------------------------------------------------------------------------- ESRT
 
 def read_esrt():
-    """fw_type==1(시스템 펌웨어) ESRT 엔트리를 읽는다. root 아니면 None."""
+    """Read the fw_type==1 (system firmware) ESRT entry. None unless root."""
     if not ESRT.is_dir():
         return None
     for entry in sorted(ESRT.iterdir()):
@@ -147,7 +149,7 @@ def read_esrt():
 
 
 def find_fwupd_device(guid):
-    """ESRT GUID에 해당하는 fwupd 장치 ID를 best-effort로 찾는다."""
+    """Best-effort lookup of the fwupd device ID carrying the ESRT GUID."""
     try:
         out = subprocess.run(["fwupdmgr", "get-devices", "--no-unreported-check"],
                              capture_output=True, text=True, timeout=90).stdout
@@ -163,7 +165,7 @@ def find_fwupd_device(guid):
     return None
 
 
-# ---------------------------------------------------------------- 캡슐 생성
+# -------------------------------------------------------------- building the capsule
 
 def build_capsule(pfat, capsule_guid, flags):
     return (capsule_guid.bytes_le
@@ -173,7 +175,7 @@ def build_capsule(pfat, capsule_guid, flags):
 
 
 def verify(cap, expect_guid, expect_flags):
-    """만든 캡슐을 펌웨어가 읽는 순서대로 되짚어 본다."""
+    """Walk the capsule back in the order the firmware reads it."""
     ok = True
     guid = uuid.UUID(bytes_le=cap[:16])
     hs, fl, cis = struct.unpack("<III", cap[16:28])
@@ -184,101 +186,101 @@ def verify(cap, expect_guid, expect_flags):
         ok = ok and good
         print(f"  {'OK  ' if good else 'FAIL'}  {label}: {value}")
 
-    print("\nCapsulePei가 보는 헤더:")
+    print("\nheader, as CapsulePei reads it:")
     check("CapsuleGuid", str(guid).upper(), guid == expect_guid)
     check("HeaderSize", f"0x{hs:X}", hs == CAPSULE_HEADER_SIZE)
     check("Flags", f"0x{fl:08X}", fl == expect_flags)
     check("CapsuleImageSize", f"{cis:,}", cis == len(cap))
 
-    print("BiosGuardPei가 보는 본문 (캡슐+HeaderSize):")
-    check("body[8:16] 시그니처", body[8:16].decode("latin1", "replace"),
+    print("body at capsule+HeaderSize, as BiosGuardPei reads it:")
+    check("body[8:16] signature", body[8:16].decode("latin1", "replace"),
           body[8:16] == b"_AMIPFAT")
     script_len, = struct.unpack("<I", body[0:4])
-    check("body[0:4] 스크립트 길이", f"0x{script_len:X} (한계 0x2020000)",
+    check("body[0:4] script length", f"0x{script_len:X} (limit 0x2020000)",
           0 < script_len <= 0x2020000)
     crlf = body.find(b"\r\n", 4)
-    tag = body[0x11:crlf].decode("latin1", "replace") if crlf > 0 else "(없음)"
-    check("첫 CRLF 전 텍스트", tag, tag.startswith("AMI_BIOS_GUARD"))
+    tag = body[0x11:crlf].decode("latin1", "replace") if crlf > 0 else "(none)"
+    check("text before first CRLF", tag, tag.startswith("AMI_BIOS_GUARD"))
     return ok
 
 
-# ---------------------------------------------------------------- main
+# ------------------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser(
-        description="삼성 BIOS 업데이터 exe → fwupd용 UEFI 캡슐")
+        description="Samsung BIOS updater exe to a UEFI capsule for fwupd")
     ap.add_argument("exe", type=pathlib.Path, help="ITEM_*_WIN_*.exe")
     ap.add_argument("-o", "--outdir", type=pathlib.Path, default=None,
-                    help="출력 디렉터리 (기본: exe와 같은 위치)")
-    ap.add_argument("--guid", help="CapsuleGuid 직접 지정 (ESRT 못 읽을 때)")
-    ap.add_argument("--flags", help="Flags 직접 지정 (예: 0x50000)")
+                    help="output directory (default: alongside the exe)")
+    ap.add_argument("--guid", help="set CapsuleGuid, for when ESRT is unreadable")
+    ap.add_argument("--flags", help="set Flags, e.g. 0x50000")
     args = ap.parse_args()
 
     if not args.exe.is_file():
-        die(f"파일 없음: {args.exe}")
+        die(f"no such file: {args.exe}")
     outdir = args.outdir or args.exe.parent
     outdir.mkdir(parents=True, exist_ok=True)
 
     exe = args.exe.read_bytes()
-    print(f"입력: {args.exe.name}  ({len(exe):,} bytes)")
+    print(f"input: {args.exe.name}  ({len(exe):,} bytes)")
 
-    # --- 페이로드 + 메타데이터
+    # --- payload and metadata
     pfat_name, pfat = find_pfat(exe)
-    print(f"  PFAT 페이로드: {pfat_name}  {len(pfat):,} bytes")
+    print(f"  PFAT payload: {pfat_name}  {len(pfat):,} bytes")
 
     inf = find_inf(exe)
     if inf:
-        print(f"  내장 INF: FirmwareId={str(inf['guid']).upper()}  "
-              f"목표버전={inf['version']}  DriverVer={inf['driver_ver']}")
+        print(f"  embedded INF: FirmwareId={str(inf['guid']).upper()}  "
+              f"target={inf['version']}  DriverVer={inf['driver_ver']}")
     else:
-        warn("내장 WFU INF를 찾지 못했습니다 (버전 검사 생략)")
+        warn("no embedded WFU INF found, skipping the version checks")
 
     esrt = read_esrt()
     if esrt:
         print(f"  ESRT: fw_class={str(esrt['guid']).upper()}")
-        print(f"        현재={esrt['version']}  최저지원={esrt['lowest']}  "
+        print(f"        current={esrt['version']}  lowest={esrt['lowest']}  "
               f"capsule_flags=0x{esrt['flags']:X}")
-        print(f"        직전시도: 버전={esrt['last_version']} "
-              f"상태={esrt['last_status']}")
+        print(f"        last attempt: version={esrt['last_version']} "
+              f"status={esrt['last_status']}")
     else:
-        warn("ESRT를 읽지 못했습니다 (root로 실행하면 자동 검출됩니다)")
+        warn("could not read ESRT, run as root to detect these automatically")
 
-    # --- 헤더 값 결정: ESRT > INF > 기본값
+    # --- pick header values: ESRT, then INF, then the default
     if args.guid:
-        guid, guid_src = uuid.UUID(args.guid), "명령행"
+        guid, guid_src = uuid.UUID(args.guid), "command line"
     elif esrt:
         guid, guid_src = esrt["guid"], "ESRT fw_class"
     elif inf:
         guid, guid_src = inf["guid"], "INF FirmwareId"
     else:
-        die("CapsuleGuid를 정할 수 없습니다. root로 실행하거나 --guid를 지정하세요")
+        die("cannot determine CapsuleGuid, run as root or pass --guid")
 
     if args.flags:
-        flags, flags_src = int(args.flags, 16), "명령행"
+        flags, flags_src = int(args.flags, 16), "command line"
     elif esrt:
         flags, flags_src = esrt["flags"], "ESRT capsule_flags"
     else:
-        flags, flags_src = FALLBACK_FLAGS, "기본값"
+        flags, flags_src = FALLBACK_FLAGS, "built-in default"
 
-    print(f"\n헤더 값 출처: CapsuleGuid ← {guid_src},  Flags ← {flags_src}")
+    print(f"\nheader values from: CapsuleGuid <- {guid_src},  Flags <- {flags_src}")
 
-    # --- 정합성 검사
-    print("\n사전 검사:")
+    # --- consistency checks
     if esrt and inf:
+        print("\npre-flight:")
         same = esrt["guid"] == inf["guid"]
         print(f"  {'OK  ' if same else 'FAIL'}  ESRT fw_class == INF FirmwareId")
         if not same:
-            die("GUID 불일치. 이 exe는 이 기기용이 아닙니다")
+            die("GUID mismatch, this exe is for a different machine")
         if inf["version"] <= esrt["version"]:
-            warn(f"목표 {inf['version']} <= 현재 {esrt['version']} "
-                 f"입니다. 다운그레이드나 재설치는 거부될 수 있습니다")
+            warn(f"target {inf['version']} <= current {esrt['version']}, "
+                 f"a downgrade or reinstall may be refused")
         else:
-            print(f"  OK    업그레이드: {esrt['version']} → {inf['version']}")
+            print(f"  OK    upgrade: {esrt['version']} -> {inf['version']}")
         if inf["version"] < esrt["lowest"]:
-            die(f"목표 {inf['version']} < 최저지원 {esrt['lowest']} "
-                f"입니다. 펌웨어가 거부합니다")
+            die(f"target {inf['version']} < lowest supported {esrt['lowest']}, "
+                f"the firmware will refuse it")
 
-    # --- 생성 + 검증
+    # --- build and verify
     cap = build_capsule(pfat, guid, flags)
     stem = pfat_name.rsplit(".", 1)[0]
     pfat_path = outdir / pfat_name
@@ -287,22 +289,22 @@ def main():
     cap_path.write_bytes(cap)
 
     ok = verify(cap, guid, flags)
-    print(f"\n출력: {cap_path}  ({len(cap):,} bytes)")
+    print(f"\noutput: {cap_path}  ({len(cap):,} bytes)")
     print(f"  sha256 = {hashlib.sha256(cap).hexdigest()}")
 
     if not ok:
-        die("검증 실패. 설치하지 마세요")
+        die("verification failed, do not install this")
 
-    # --- 설치 안내
+    # --- how to install it
     dev = find_fwupd_device(guid)
     print("\n" + "=" * 72)
-    print("설치 (AC 어댑터 연결 필수):")
+    print("install (AC adapter required):")
     print(f"  sudo fwupdtool install-blob {cap_path} \\")
-    print(f"    {dev if dev else '<장치ID: fwupdmgr get-devices의 System Firmware>'}")
-    print("\n재부팅 후 결과 확인:")
+    print(f"    {dev if dev else '<device ID: System Firmware in fwupdmgr get-devices>'}")
+    print("\ncheck the result after rebooting:")
     print("  sudo grep -r . /sys/firmware/efi/esrt/entries/entry0/")
-    print("    last_attempt_status  0=성공  3=버전거부  4=이미지형식오류  "
-          "5=인증실패  6/7=전원")
+    print("    last_attempt_status  0=success  3=version refused  "
+          "4=bad image format  5=auth failed  6/7=power")
     print("=" * 72)
 
 
