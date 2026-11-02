@@ -125,12 +125,12 @@ def find_inf(exe_bytes):
             if "FirmwareId" not in text:
                 continue
             fid = re.search(r"FirmwareId,,\{([0-9A-Fa-f\-]+)\}", text)
-            fver = re.search(r"FirmwareVersion,%REG_DWORD%,(\d+)", text)
+            fver = re.search(r"FirmwareVersion,%REG_DWORD%,(0[xX][0-9A-Fa-f]+|\d+)", text)
             dver = re.search(r"DriverVer\s*=\s*(.+)", text)
             if fid and fver:
                 return {
                     "guid": uuid.UUID(fid.group(1)),
-                    "version": int(fver.group(1)),
+                    "version": (int(fver.group(1), 16) if fver.group(1).lower().startswith("0x") else int(fver.group(1))),
                     "driver_ver": dver.group(1).strip() if dver else "?",
                 }
     return None
